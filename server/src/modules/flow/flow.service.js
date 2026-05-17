@@ -4,12 +4,11 @@ const FlowModel = require('./flow.model');
 
 const flowSessions = new Map();
 
-// Mapeia os tipos "semânticos" usados no editor/engine para os valores do enum do banco
 const NODE_TYPE_TO_DB = {
   message:     'message',
-  input:       'capture',   // input do engine → capture no banco
+  input:       'capture',
   capture:     'capture',
-  choice:      'menu',      // choice → menu
+  choice:      'menu',
   menu:        'menu',
   api:         'integration',
   integration: 'integration',
@@ -19,7 +18,6 @@ const NODE_TYPE_TO_DB = {
   end:         'end',
 };
 
-// Mapeia de volta: banco → engine (capture vira input para o FlowEngine continuar funcionando)
 const DB_TYPE_TO_ENGINE = {
   capture:     'input',
   menu:        'choice',
@@ -31,28 +29,26 @@ const DB_TYPE_TO_ENGINE = {
   end:         'end',
 };
 
-const toDbType = (type) => NODE_TYPE_TO_DB[type] || type;
-const toEngineType = (type) => DB_TYPE_TO_ENGINE[type] || type;
+const toDbType     = (type) => NODE_TYPE_TO_DB[type]    || type;
+const toEngineType = (type) => DB_TYPE_TO_ENGINE[type]  || type;
 
 class FlowService {
-  // ─────────────────────────────────────────────
-  // CRUD de Flows
-  // ─────────────────────────────────────────────
 
   async createFlow(flowData) {
     return await db.transaction(async (trx) => {
       const [flow] = await trx('flows')
         .insert({
           chatbot_id: flowData.chatbotId || flowData.chatbot_id || null,
-          name: flowData.name,
-          version: flowData.version || 1,
+          name:       flowData.name,
+          version:    flowData.version || 1,
           ...(flowData.status ? { status: flowData.status } : {}),
         })
         .returning('*');
 
-      const states = flowData.states || [];
-      const edges  = flowData.edges  || [];
-      const nodeIdMap = {};
+      const states     = flowData.states || [];
+      const edges      = flowData.edges  || [];
+      const nodeIdMap  = {};
+      let insertedNodes = [];   // declarado fora do if para ficar no escopo do return
 
       if (states.length > 0) {
         const nodePayloads = states.map((s) => ({
@@ -60,21 +56,21 @@ class FlowService {
           type:       toDbType(s.type),
           data: {
             label:    s.id,
-            message:  s.message  || null,
-            variable: s.variable || null,
-            options:  s.options  || null,
-            url:      s.url      || null,
-            saveAs:   s.saveAs   || null,
-            key:      s.key      || null,
-            value:    s.value    || null,
-            condition:s.condition|| null,
-            delay:    s.delay    || 0,
+            message:  s.message   || null,
+            variable: s.variable  || null,
+            options:  s.options   || null,
+            url:      s.url       || null,
+            saveAs:   s.saveAs    || null,
+            key:      s.key       || null,
+            value:    s.value     || null,
+            condition:s.condition || null,
+            delay:    s.delay     || 0,
           },
           position_x: s.position_x ?? 0,
           position_y: s.position_y ?? 0,
         }));
 
-        const insertedNodes = await trx('flow_nodes').insert(nodePayloads).returning('*');
+        insertedNodes = await trx('flow_nodes').insert(nodePayloads).returning('*');
         insertedNodes.forEach((n) => {
           if (n.data?.label) nodeIdMap[n.data.label] = n.id;
         });
@@ -89,11 +85,12 @@ class FlowService {
           condition_type:  e.condition?.operator || null,
           condition_value: e.condition?.value != null ? String(e.condition.value) : null,
         }));
-
         await trx('flow_edges').insert(edgePayloads);
       }
 
-      return await FlowModel.findWithGraph(flow.id);
+      // lê dentro da trx para não depender do commit
+      const insertedEdges = await trx('flow_edges').where({ flow_id: flow.id });
+      return { ...flow, states: insertedNodes, edges: insertedEdges };
     });
   }
 
@@ -125,7 +122,8 @@ class FlowService {
       await trx('flow_edges').where({ flow_id: flowId }).del();
       await trx('flow_nodes').where({ flow_id: flowId }).del();
 
-      const nodeIdMap = {};
+      const nodeIdMap   = {};
+      let insertedNodes = [];   // declarado fora do if
 
       if (states.length > 0) {
         const nodePayloads = states.map((s) => ({
@@ -133,22 +131,22 @@ class FlowService {
           type:       toDbType(s.type),
           data: {
             label:    s.id,
-            message:  s.message  || null,
-            variable: s.variable || null,
-            options:  s.options  || null,
-            url:      s.url      || null,
-            saveAs:   s.saveAs   || null,
-            key:      s.key      || null,
-            value:    s.value    || null,
-            condition:s.condition|| null,
-            delay:    s.delay    || 0,
+            message:  s.message   || null,
+            variable: s.variable  || null,
+            options:  s.options   || null,
+            url:      s.url       || null,
+            saveAs:   s.saveAs    || null,
+            key:      s.key       || null,
+            value:    s.value     || null,
+            condition:s.condition || null,
+            delay:    s.delay     || 0,
           },
           position_x: s.position_x ?? 0,
           position_y: s.position_y ?? 0,
         }));
 
-        const inserted = await trx('flow_nodes').insert(nodePayloads).returning('*');
-        inserted.forEach((n) => {
+        insertedNodes = await trx('flow_nodes').insert(nodePayloads).returning('*');
+        insertedNodes.forEach((n) => {
           if (n.data?.label) nodeIdMap[n.data.label] = n.id;
         });
       }
@@ -162,12 +160,13 @@ class FlowService {
           condition_type:  e.condition?.operator || null,
           condition_value: e.condition?.value != null ? String(e.condition.value) : null,
         }));
-
         await trx('flow_edges').insert(edgePayloads);
       }
 
       await trx('flows').where({ id: flowId }).update({ updated_at: db.fn.now() });
-      return await FlowModel.findWithGraph(flowId);
+      const updatedFlow   = await trx('flows').where({ id: flowId }).first();
+      const insertedEdges = await trx('flow_edges').where({ flow_id: flowId });
+      return { ...updatedFlow, states: insertedNodes, edges: insertedEdges };
     });
   }
 
@@ -182,35 +181,31 @@ class FlowService {
     return true;
   }
 
-  // ─────────────────────────────────────────────
-  // Sessões
-  // ─────────────────────────────────────────────
+  // ── Sessões ──────────────────────────────────
 
   async startFlowSession(flowId, userId) {
-    const flow = await this.getFlowWithGraph(flowId);
-    const engineFlow = this._toEngineFormat(flow);
-
-    const sessionId = this._generateId();
+    const flow        = await this.getFlowWithGraph(flowId);
+    const engineFlow  = this._toEngineFormat(flow);
     const startNodeId = engineFlow.states[0]?.id;
     if (!startNodeId) throw new Error('Fluxo não tem nenhum node');
 
-    const engine = new FlowEngine(engineFlow);
-    const result = await engine.run({
+    const sessionId = this._generateId();
+    const engine    = new FlowEngine(engineFlow);
+    const result    = await engine.run({
       currentNodeId: startNodeId,
-      data: null,
+      data:    null,
       context: { userId, sessionId },
     });
 
     const session = {
-      id: sessionId,
+      id:            sessionId,
       flowId,
       userId,
       currentNodeId: result.nextNodeId,
-      context: result.context,
-      startedAt: new Date(),
-      messages: result.responses || [],
+      context:       result.context,
+      startedAt:     new Date(),
+      messages:      result.responses || [],
     };
-
     flowSessions.set(sessionId, session);
     return { sessionId, responses: result.responses, context: result.context };
   }
@@ -219,26 +214,26 @@ class FlowService {
     const session = flowSessions.get(sessionId);
     if (!session) throw new Error(`Sessão com ID ${sessionId} não encontrada`);
 
-    const flow = await this.getFlowWithGraph(session.flowId);
+    const flow       = await this.getFlowWithGraph(session.flowId);
     const engineFlow = this._toEngineFormat(flow);
-    const engine = new FlowEngine(engineFlow);
+    const engine     = new FlowEngine(engineFlow);
 
     const result = await engine.run({
       currentNodeId: session.currentNodeId,
-      data: userInput,
+      data:    userInput,
       context: session.context,
     });
 
     session.currentNodeId = result.nextNodeId;
-    session.context = result.context;
+    session.context       = result.context;
     session.messages.push(...result.responses);
-    session.updatedAt = new Date();
+    session.updatedAt     = new Date();
     flowSessions.set(sessionId, session);
 
     return {
       sessionId,
-      responses: result.responses,
-      context: result.context,
+      responses:  result.responses,
+      context:    result.context,
       isComplete: this._isFlowComplete(engineFlow, result.nextNodeId),
     };
   }
@@ -250,7 +245,7 @@ class FlowService {
   }
 
   async endFlowSession(sessionId) {
-    const session = await this.getFlowSession(sessionId);
+    const session  = await this.getFlowSession(sessionId);
     session.endedAt = new Date();
     flowSessions.set(sessionId, session);
     return session;
@@ -260,21 +255,19 @@ class FlowService {
     const session = await this.getFlowSession(sessionId);
     return {
       sessionId,
-      flowId: session.flowId,
-      userId: session.userId,
-      duration: session.endedAt
-        ? (session.endedAt - session.startedAt) / 1000 + 's'
-        : (new Date() - session.startedAt) / 1000 + 's',
+      flowId:        session.flowId,
+      userId:        session.userId,
+      duration:      session.endedAt
+        ? (session.endedAt  - session.startedAt) / 1000 + 's'
+        : (new Date()       - session.startedAt) / 1000 + 's',
       messagesCount: session.messages.length,
-      currentNode: session.currentNodeId,
-      startedAt: session.startedAt,
-      endedAt: session.endedAt || null,
+      currentNode:   session.currentNodeId,
+      startedAt:     session.startedAt,
+      endedAt:       session.endedAt || null,
     };
   }
 
-  // ─────────────────────────────────────────────
-  // Validação
-  // ─────────────────────────────────────────────
+  // ── Validação ────────────────────────────────
 
   validateFlow(flowData) {
     const errors = [];
@@ -295,25 +288,62 @@ class FlowService {
     return { valid: errors.length === 0, errors };
   }
 
-  // ─────────────────────────────────────────────
-  // Helpers privados
-  // ─────────────────────────────────────────────
+  // ── Helpers privados ─────────────────────────
 
   _toEngineFormat(flow) {
-    const states = (flow.states || []).map((n) => ({
+    const nodes = flow.states || [];
+
+    // Monta mapa UUID → label para resolver as edges do banco
+    const uuidToLabel = {};
+    nodes.forEach((n) => {
+      const label = n.data?.label;
+      if (label) uuidToLabel[n.id] = label;
+    });
+
+    const states = nodes.map((n) => ({
       id:   n.data?.label || n.id,
-      type: toEngineType(n.type), // converte capture→input, menu→choice, etc.
+      type: toEngineType(n.type),
       ...(n.data || {}),
     }));
 
-    const edges = (flow.edges || []).map((e) => ({
-      from:      e.from || e.source_node_id,
-      to:        e.to   || e.target_node_id,
-      condition: e.condition || null,
-    }));
+    const edges = (flow.edges || []).map((e) => {
+      // Resolve source/target: se for UUID, converte para label
+      const fromRaw = e.from || e.source_node_id;
+      const toRaw   = e.to   || e.target_node_id;
+      const from    = uuidToLabel[fromRaw] || fromRaw;
+      const to      = uuidToLabel[toRaw]   || toRaw;
+
+      // Converte condition objeto → função que o engine entende
+      const raw = e.condition || null;
+      let condition = null;
+      if (raw && raw.operator && raw.value != null) {
+        const val = String(raw.value).toLowerCase();
+        condition = (input) => {
+          if (input == null) return false;
+          return String(input).toLowerCase().includes(val);
+        };
+      }
+
+      return { from, to, condition };
+    });
 
     return { ...flow, states, edges };
   }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
   _isFlowComplete(flow, nodeId) {
     const node = flow.states.find((s) => s.id === nodeId);
