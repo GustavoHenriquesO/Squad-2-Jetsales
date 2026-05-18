@@ -5,12 +5,75 @@
 // chatbots, etc.) possa evoluir sem tocar nos outros.
 
 const router = require('express').Router();
-const chatbotRoutes = require('../modules/chatbot/chatbot.routes');
-const messageRoutes = require('../modules/conversation/message.routes');
-const conversationRoutes = require('../modules/conversation/conversation.routes');
+const { authRequired } = require('../middlewares/auth.middleware');
 
-router.use('/chatbots', chatbotRoutes);
-router.use('/messages', messageRoutes);
-router.use('/conversations', conversationRoutes);
+/* -------------------- Helpers -------------------- */
+
+/**
+ * Tenta carregar um router. Se o módulo ainda não existe (ex.: módulos das
+ * próximas fases), devolve um router stub que responde 501 Not Implemented —
+ * assim o front não recebe 404 silencioso e a equipe vê o que falta no log.
+ */
+function loadOrStub(modulePath, label) {
+  try {
+    const mod = require(modulePath);
+    if (typeof mod !== 'function' && typeof mod?.handle !== 'function') {
+      console.warn(`⚠️  [${label}] export não é um router Express — usando stub`);
+      return makeStub(label);
+    }
+    return mod;
+  } catch (err) {
+    if (err.code === 'MODULE_NOT_FOUND' && err.message.includes(modulePath.split('/').pop())) {
+      console.warn(`⚠️  [${label}] módulo ainda não implementado — usando stub 501`);
+      return makeStub(label, 'NOT_IMPLEMENTED');
+    }
+    // Bug no módulo (sintaxe, dependência faltando, etc.): degradamos pra stub
+    // pra não derrubar o backend inteiro. Log loud pra equipe não ignorar.
+    console.error(`❌ [${label}] falha ao carregar módulo (${err.code || err.name}): ${err.message} — usando stub 503`);
+    return makeStub(label, 'MODULE_BROKEN', 503);
+  }
+}
+
+function makeStub(label, code = 'NOT_IMPLEMENTED', status = 501) {
+  const stub = require('express').Router();
+  stub.all('*', (req, res) => {
+    res.status(status).json({
+      error: code === 'MODULE_BROKEN'
+        ? `Endpoint indisponível: módulo ${label} com erro de carregamento`
+        : `Endpoint não implementado: ${label}`,
+      code,
+      path: req.originalUrl,
+    });
+  });
+  return stub;
+}
+
+/* -------------------- Rotas públicas -------------------- */
+
+// Auth — login, logout, refresh, me, forgot-password
+router.use('/auth', loadOrStub('../modules/auth/auth.routes', 'auth'));
+
+/* -------------------- Rotas autenticadas -------------------- */
+//
+// A partir daqui tudo exige cookie httpOnly válido + CSRF double-submit em
+// métodos state-changing. Os módulos individuais NÃO precisam aplicar
+// authRequired novamente — é aplicado uma vez aqui.
+
+router.use(authRequired);
+
+router.use('/chatbots', loadOrStub('../modules/chatbot/chatbot.routes', 'chatbots'));
+router.use('/flows', loadOrStub('../modules/flow/flow.routes', 'flows'));
+router.use('/flow-nodes', loadOrStub('../modules/flow/node.routes', 'flow-nodes'));
+router.use('/flow-edges', loadOrStub('../modules/flow/edge.routes', 'flow-edges'));
+router.use(
+  '/whatsapp-connections',
+  loadOrStub('../modules/whatsapp/whatsapp.routes', 'whatsapp-connections')
+);
+router.use(
+  '/conversations',
+  loadOrStub('../modules/conversation/conversation.routes', 'conversations')
+);
+router.use('/tickets', loadOrStub('../modules/ticket/ticket.routes', 'tickets'));
+router.use('/dashboard', loadOrStub('../modules/dashboard/dashboard.routes', 'dashboard'));
 
 module.exports = router;
