@@ -3,26 +3,20 @@
   "version": "1.0.0",
   "main": "src/app.js",
   "scripts": {
-    "start": "node src/app.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "nodemon src/app.js",
-    "migrate": "knex --knexfile knexfile.js migrate:latest",
-    "migrate:make": "knex --knexfile knexfile.js migrate:make",
-    "migrate:rollback": "knex --knexfile knexfile.js migrate:rollback",
-    "seed": "knex --knexfile knexfile.js seed:run"
+    "migrate:latest": "knex migrate:latest",
+    "migrate:rollback": "knex migrate:rollback",
+    "migrate:make": "knex migrate:make"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
-    "express": "^4.21.2",
-    "jsonwebtoken": "^9.0.2",
-    "knex": "^3.1.0",
-    "pg": "^8.13.1",
-    "uuid": "^11.0.5",
-    "zod": "^3.24.1"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.14"
+    "express": "^5.2.1",
+    "knex": "^3.2.10",
+    "nodemon": "^3.1.14",
+    "pg": "^8.11.1"
   }
 }

@@ -1,383 +1,361 @@
-// server/src/modules/flow/flow.service.js
-//
-// CRUD DB-backed do módulo flow (knex). Contrato consumido em
-// client/src/lib/api/flows.ts. Toda função recebe organizationId
-// explícito — o controller faz a ponte com req.auth.
-
 const db = require('../../database');
-const { httpError } = require('../../middlewares/error.middleware');
-const { mapFlow, mapNode, mapEdge } = require('./flow.mapper');
-const {
-  assertFlowOwned,
-  assertNodeOwned,
-  assertEdgeOwned,
-} = require('./flow.guards');
+const { FlowEngine } = require('./flow.engine');
+const FlowModel = require('./flow.model');
 
-/* ============================================================ */
-/*  /flows                                                       */
-/* ============================================================ */
+const flowSessions = new Map();
 
-/**
- * GET /flows/:id -> FlowWithGraph
- * Carrega o flow + nodes + edges (todos da mesma org).
- */
-async function getFlowWithGraph(organizationId, id) {
-  const flowRow = await assertFlowOwned(db, id, organizationId);
+const NODE_TYPE_TO_DB = {
+  message:     'message',
+  input:       'capture',
+  capture:     'capture',
+  choice:      'menu',
+  menu:        'menu',
+  api:         'integration',
+  integration: 'integration',
+  condition:   'condition',
+  wait:        'wait',
+  trigger:     'trigger',
+  end:         'end',
+};
 
-  const [nodeRows, edgeRows] = await Promise.all([
-    db('flow_nodes').where({ flow_id: id }).orderBy('created_at', 'asc'),
-    db('flow_edges').where({ flow_id: id }).orderBy('created_at', 'asc'),
-  ]);
+const DB_TYPE_TO_ENGINE = {
+  capture:     'input',
+  menu:        'choice',
+  integration: 'api',
+  message:     'message',
+  condition:   'condition',
+  wait:        'wait',
+  trigger:     'trigger',
+  end:         'end',
+};
 
-  return {
-    ...mapFlow(flowRow),
-    nodes: nodeRows.map(mapNode),
-    edges: edgeRows.map(mapEdge),
-  };
-}
+const toDbType     = (type) => NODE_TYPE_TO_DB[type]    || type;
+const toEngineType = (type) => DB_TYPE_TO_ENGINE[type]  || type;
 
-/**
- * PATCH /flows/:id -> Flow
- * Atualiza name e/ou status. Bloqueia draft -> published por aqui (use /publish).
- */
-async function updateFlow(organizationId, id, patch) {
-  const data = {};
-  if (patch.name !== undefined) data.name = patch.name;
+class FlowService {
 
-  if (patch.status !== undefined) {
-    const current = await assertFlowOwned(db, id, organizationId);
-    if (current.status !== 'published' && patch.status === 'published') {
-      throw httpError(
-        409,
-        'Use /flows/:id/publish para promover draft a published',
-        'FLOW_PUBLISHED'
-      );
-    }
-    data.status = patch.status;
-  } else {
-    await assertFlowOwned(db, id, organizationId);
+  async createFlow(flowData) {
+    return await db.transaction(async (trx) => {
+      const [flow] = await trx('flows')
+        .insert({
+          chatbot_id: flowData.chatbotId || flowData.chatbot_id || null,
+          name:       flowData.name,
+          version:    flowData.version || 1,
+          ...(flowData.status ? { status: flowData.status } : {}),
+        })
+        .returning('*');
+
+      const states     = flowData.states || [];
+      const edges      = flowData.edges  || [];
+      const nodeIdMap  = {};
+      let insertedNodes = [];   // declarado fora do if para ficar no escopo do return
+
+      if (states.length > 0) {
+        const nodePayloads = states.map((s) => ({
+          flow_id:    flow.id,
+          type:       toDbType(s.type),
+          data: {
+            label:    s.id,
+            message:  s.message   || null,
+            variable: s.variable  || null,
+            options:  s.options   || null,
+            url:      s.url       || null,
+            saveAs:   s.saveAs    || null,
+            key:      s.key       || null,
+            value:    s.value     || null,
+            condition:s.condition || null,
+            delay:    s.delay     || 0,
+          },
+          position_x: s.position_x ?? 0,
+          position_y: s.position_y ?? 0,
+        }));
+
+        insertedNodes = await trx('flow_nodes').insert(nodePayloads).returning('*');
+        insertedNodes.forEach((n) => {
+          if (n.data?.label) nodeIdMap[n.data.label] = n.id;
+        });
+      }
+
+      if (edges.length > 0) {
+        const edgePayloads = edges.map((e) => ({
+          flow_id:         flow.id,
+          source_node_id:  nodeIdMap[e.from] || e.from,
+          target_node_id:  nodeIdMap[e.to]   || e.to,
+          source_handle:   e.source_handle   || null,
+          condition_type:  e.condition?.operator || null,
+          condition_value: e.condition?.value != null ? String(e.condition.value) : null,
+        }));
+        await trx('flow_edges').insert(edgePayloads);
+      }
+
+      // lê dentro da trx para não depender do commit
+      const insertedEdges = await trx('flow_edges').where({ flow_id: flow.id });
+      return { ...flow, states: insertedNodes, edges: insertedEdges };
+    });
   }
 
-  data.updated_at = db.fn.now();
+  async getFlow(flowId) {
+    const flow = await FlowModel.findOne(flowId);
+    if (!flow) throw new Error(`Fluxo com ID ${flowId} não encontrado`);
+    return flow;
+  }
 
-  const [row] = await db('flows')
-    .where({ id })
-    .update(data)
-    .returning('*');
+  async getFlowWithGraph(flowId) {
+    const flow = await FlowModel.findWithGraph(flowId);
+    if (!flow) throw new Error(`Fluxo com ID ${flowId} não encontrado`);
+    return flow;
+  }
 
-  if (!row) throw httpError(404, 'Flow not found', 'NOT_FOUND');
-  return mapFlow(row);
-}
+  async listFlows({ chatbotId } = {}) {
+    return await FlowModel.findAll({ chatbotId });
+  }
 
-/**
- * POST /flows/:id/publish -> Flow
- * Idempotente: se já published, devolve o estado atual sem bumpar versão.
- * Caso contrário, valida o grafo (ver checkGraphIntegrity) e promove
- * status='published', version+=1.
- */
-async function publishFlow(organizationId, id) {
-  return db.transaction(async (trx) => {
-    const flow = await assertFlowOwned(trx, id, organizationId);
+  async updateFlow(flowId, updates) {
+    await this.getFlow(flowId);
+    return await FlowModel.update(flowId, updates);
+  }
 
-    if (flow.status === 'published') {
-      return mapFlow(flow);
-    }
+  async replaceGraph(flowId, { states = [], edges = [] }) {
+    await this.getFlow(flowId);
 
-    const [nodeRows, edgeRows] = await Promise.all([
-      trx('flow_nodes').where({ flow_id: id }),
-      trx('flow_edges').where({ flow_id: id }),
-    ]);
+    return await db.transaction(async (trx) => {
+      await trx('flow_edges').where({ flow_id: flowId }).del();
+      await trx('flow_nodes').where({ flow_id: flowId }).del();
 
-    const issues = checkGraphIntegrity(nodeRows, edgeRows);
-    if (Object.keys(issues).length > 0) {
-      throw httpError(422, 'Grafo inválido para publicação', 'FLOW_INVALID_GRAPH', issues);
-    }
+      const nodeIdMap   = {};
+      let insertedNodes = [];   // declarado fora do if
 
-    await trx('flows').where({ id }).update({
-      status: 'published',
-      version: trx.raw('version + 1'),
-      updated_at: trx.fn.now(),
+      if (states.length > 0) {
+        const nodePayloads = states.map((s) => ({
+          flow_id:    flowId,
+          type:       toDbType(s.type),
+          data: {
+            label:    s.id,
+            message:  s.message   || null,
+            variable: s.variable  || null,
+            options:  s.options   || null,
+            url:      s.url       || null,
+            saveAs:   s.saveAs    || null,
+            key:      s.key       || null,
+            value:    s.value     || null,
+            condition:s.condition || null,
+            delay:    s.delay     || 0,
+          },
+          position_x: s.position_x ?? 0,
+          position_y: s.position_y ?? 0,
+        }));
+
+        insertedNodes = await trx('flow_nodes').insert(nodePayloads).returning('*');
+        insertedNodes.forEach((n) => {
+          if (n.data?.label) nodeIdMap[n.data.label] = n.id;
+        });
+      }
+
+      if (edges.length > 0) {
+        const edgePayloads = edges.map((e) => ({
+          flow_id:         flowId,
+          source_node_id:  nodeIdMap[e.from] || e.from,
+          target_node_id:  nodeIdMap[e.to]   || e.to,
+          source_handle:   e.source_handle   || null,
+          condition_type:  e.condition?.operator || null,
+          condition_value: e.condition?.value != null ? String(e.condition.value) : null,
+        }));
+        await trx('flow_edges').insert(edgePayloads);
+      }
+
+      await trx('flows').where({ id: flowId }).update({ updated_at: db.fn.now() });
+      const updatedFlow   = await trx('flows').where({ id: flowId }).first();
+      const insertedEdges = await trx('flow_edges').where({ flow_id: flowId });
+      return { ...updatedFlow, states: insertedNodes, edges: insertedEdges };
+    });
+  }
+
+  async publishFlow(flowId) {
+    await this.getFlow(flowId);
+    return await FlowModel.publish(flowId);
+  }
+
+  async deleteFlow(flowId) {
+    await this.getFlow(flowId);
+    await FlowModel.remove(flowId);
+    return true;
+  }
+
+  // ── Sessões ──────────────────────────────────
+
+  async startFlowSession(flowId, userId) {
+    const flow        = await this.getFlowWithGraph(flowId);
+    const engineFlow  = this._toEngineFormat(flow);
+    const startNodeId = engineFlow.states[0]?.id;
+    if (!startNodeId) throw new Error('Fluxo não tem nenhum node');
+
+    const sessionId = this._generateId();
+    const engine    = new FlowEngine(engineFlow);
+    const result    = await engine.run({
+      currentNodeId: startNodeId,
+      data:    null,
+      context: { userId, sessionId },
     });
 
-    const fresh = await trx('flows').where({ id }).first();
-    return mapFlow(fresh);
-  });
-}
-
-/**
- * POST /flows/:id/bulk-update -> { ok: true }
- * Diff por id em nodes; edges são truncadas e reinseridas (mais simples e
- * seguro com FK CASCADE). Salvar volta o flow para 'draft'.
- */
-async function bulkUpdateFlow(organizationId, id, payload) {
-  const { nodes, edges } = payload;
-
-  // Coerência: todo flowId interno deve bater com :id
-  for (const n of nodes) {
-    if (n.flowId !== id) {
-      throw httpError(422, 'Node flowId divergente do path', 'EDGE_CROSS_FLOW');
-    }
-  }
-  for (const e of edges) {
-    if (e.flowId !== id) {
-      throw httpError(422, 'Edge flowId divergente do path', 'EDGE_CROSS_FLOW');
-    }
+    const session = {
+      id:            sessionId,
+      flowId,
+      userId,
+      currentNodeId: result.nextNodeId,
+      context:       result.context,
+      startedAt:     new Date(),
+      messages:      result.responses || [],
+    };
+    flowSessions.set(sessionId, session);
+    return { sessionId, responses: result.responses, context: result.context };
   }
 
-  // IDs duplicados
-  const dupNode = findDuplicate(nodes.map((n) => n.id));
-  if (dupNode) {
-    throw httpError(400, `node.id duplicado: ${dupNode}`, 'VALIDATION_ERROR', { 'nodes.id': 'duplicado' });
-  }
-  const dupEdge = findDuplicate(edges.map((e) => e.id));
-  if (dupEdge) {
-    throw httpError(400, `edge.id duplicado: ${dupEdge}`, 'VALIDATION_ERROR', { 'edges.id': 'duplicado' });
-  }
+  async processFlowInput(sessionId, userInput) {
+    const session = flowSessions.get(sessionId);
+    if (!session) throw new Error(`Sessão com ID ${sessionId} não encontrada`);
 
-  // Edges referenciando nodes que não estão no payload
-  const incomingNodeIds = new Set(nodes.map((n) => n.id));
-  for (const e of edges) {
-    if (!incomingNodeIds.has(e.sourceNodeId) || !incomingNodeIds.has(e.targetNodeId)) {
-      throw httpError(
-        422,
-        'Edge referencia node fora do conjunto enviado',
-        'EDGE_CROSS_FLOW'
-      );
-    }
-  }
+    const flow       = await this.getFlowWithGraph(session.flowId);
+    const engineFlow = this._toEngineFormat(flow);
+    const engine     = new FlowEngine(engineFlow);
 
-  await db.transaction(async (trx) => {
-    await assertFlowOwned(trx, id, organizationId);
-
-    const existing = await trx('flow_nodes').where({ flow_id: id }).select('id');
-    const existingIds = new Set(existing.map((r) => r.id));
-    const toDeleteNodes = [...existingIds].filter((nid) => !incomingNodeIds.has(nid));
-
-    // Edges precisam sair antes dos nodes (FK). Reinserimos todas em seguida.
-    await trx('flow_edges').where({ flow_id: id }).del();
-
-    if (toDeleteNodes.length) {
-      await trx('flow_nodes').whereIn('id', toDeleteNodes).del();
-    }
-
-    if (nodes.length) {
-      const rows = nodes.map((n) => ({
-        id: n.id,
-        flow_id: id,
-        type: n.type,
-        data: n.data,
-        position_x: n.positionX,
-        position_y: n.positionY,
-        updated_at: trx.fn.now(),
-      }));
-      await trx('flow_nodes')
-        .insert(rows)
-        .onConflict('id')
-        .merge(['type', 'data', 'position_x', 'position_y', 'updated_at']);
-    }
-
-    if (edges.length) {
-      const rows = edges.map((e) => ({
-        id: e.id,
-        flow_id: id,
-        source_node_id: e.sourceNodeId,
-        target_node_id: e.targetNodeId,
-        source_handle: e.sourceHandle ?? null,
-        condition_type: e.conditionType ?? null,
-        condition_value: e.conditionValue ?? null,
-      }));
-      await trx('flow_edges').insert(rows);
-    }
-
-    // Salvar implica edição -> volta para draft. Publicar é ato deliberado.
-    await trx('flows').where({ id }).update({
-      status: 'draft',
-      updated_at: trx.fn.now(),
+    const result = await engine.run({
+      currentNodeId: session.currentNodeId,
+      data:    userInput,
+      context: session.context,
     });
-  });
 
-  return { ok: true };
-}
+    session.currentNodeId = result.nextNodeId;
+    session.context       = result.context;
+    session.messages.push(...result.responses);
+    session.updatedAt     = new Date();
+    flowSessions.set(sessionId, session);
 
-/* ============================================================ */
-/*  /flow-nodes                                                  */
-/* ============================================================ */
-
-async function createNode(organizationId, input) {
-  await assertFlowOwned(db, input.flowId, organizationId);
-  const [row] = await db('flow_nodes')
-    .insert({
-      flow_id: input.flowId,
-      type: input.type,
-      data: input.data,
-      position_x: input.positionX,
-      position_y: input.positionY,
-    })
-    .returning('*');
-  return mapNode(row);
-}
-
-async function updateNode(organizationId, id, patch) {
-  await assertNodeOwned(db, id, organizationId);
-
-  const data = {};
-  if (patch.type !== undefined) data.type = patch.type;
-  if (patch.data !== undefined) data.data = patch.data;
-  if (patch.positionX !== undefined) data.position_x = patch.positionX;
-  if (patch.positionY !== undefined) data.position_y = patch.positionY;
-
-  if (Object.keys(data).length === 0) {
-    const fresh = await db('flow_nodes').where({ id }).first();
-    if (!fresh) throw httpError(404, 'Node not found', 'NOT_FOUND');
-    return mapNode(fresh);
+    return {
+      sessionId,
+      responses:  result.responses,
+      context:    result.context,
+      isComplete: this._isFlowComplete(engineFlow, result.nextNodeId),
+    };
   }
 
-  data.updated_at = db.fn.now();
-
-  const [row] = await db('flow_nodes')
-    .where({ id })
-    .update(data)
-    .returning('*');
-  if (!row) throw httpError(404, 'Node not found', 'NOT_FOUND');
-  return mapNode(row);
-}
-
-async function deleteNode(organizationId, id) {
-  await assertNodeOwned(db, id, organizationId);
-  // Edges referenciando o node saem via FK CASCADE.
-  await db('flow_nodes').where({ id }).del();
-}
-
-/* ============================================================ */
-/*  /flow-edges                                                  */
-/* ============================================================ */
-
-async function createEdge(organizationId, input) {
-  await assertFlowOwned(db, input.flowId, organizationId);
-
-  const countRow = await db('flow_nodes')
-    .whereIn('id', [input.sourceNodeId, input.targetNodeId])
-    .andWhere({ flow_id: input.flowId })
-    .count('* as c')
-    .first();
-  if (Number(countRow.c) !== 2) {
-    throw httpError(422, 'Edge nodes must belong to flow', 'EDGE_CROSS_FLOW');
+  async getFlowSession(sessionId) {
+    const session = flowSessions.get(sessionId);
+    if (!session) throw new Error(`Sessão com ID ${sessionId} não encontrada`);
+    return session;
   }
 
-  const [row] = await db('flow_edges')
-    .insert({
-      flow_id: input.flowId,
-      source_node_id: input.sourceNodeId,
-      target_node_id: input.targetNodeId,
-      source_handle: input.sourceHandle ?? null,
-      condition_type: input.conditionType ?? null,
-      condition_value: input.conditionValue ?? null,
-    })
-    .returning('*');
-  return mapEdge(row);
-}
-
-async function deleteEdge(organizationId, id) {
-  await assertEdgeOwned(db, id, organizationId);
-  await db('flow_edges').where({ id }).del();
-}
-
-/* ============================================================ */
-/*  Helpers                                                      */
-/* ============================================================ */
-
-function findDuplicate(arr) {
-  const seen = new Set();
-  for (const v of arr) {
-    if (seen.has(v)) return v;
-    seen.add(v);
+  async endFlowSession(sessionId) {
+    const session  = await this.getFlowSession(sessionId);
+    session.endedAt = new Date();
+    flowSessions.set(sessionId, session);
+    return session;
   }
   return null;
 }
 
-/**
- * Validação mínima de integridade para o publish:
- *   - existe pelo menos 1 trigger
- *   - todo node não-trigger tem ao menos 1 edge de entrada
- *   - não há ciclos
- */
-function checkGraphIntegrity(nodeRows, edgeRows) {
-  const issues = {};
-
-  if (nodeRows.length === 0) {
-    issues['nodes'] = 'flow não tem nodes';
-    return issues;
+  async getSessionStats(sessionId) {
+    const session = await this.getFlowSession(sessionId);
+    return {
+      sessionId,
+      flowId:        session.flowId,
+      userId:        session.userId,
+      duration:      session.endedAt
+        ? (session.endedAt  - session.startedAt) / 1000 + 's'
+        : (new Date()       - session.startedAt) / 1000 + 's',
+      messagesCount: session.messages.length,
+      currentNode:   session.currentNodeId,
+      startedAt:     session.startedAt,
+      endedAt:       session.endedAt || null,
+    };
   }
 
-  const triggers = nodeRows.filter((n) => n.type === 'trigger');
-  if (triggers.length === 0) {
-    issues['trigger'] = 'flow precisa de pelo menos um node do tipo trigger';
-  }
+  // ── Validação ────────────────────────────────
 
-  const incoming = new Map();
-  for (const n of nodeRows) incoming.set(n.id, 0);
-  for (const e of edgeRows) {
-    if (incoming.has(e.target_node_id)) {
-      incoming.set(e.target_node_id, incoming.get(e.target_node_id) + 1);
+  validateFlow(flowData) {
+    const errors = [];
+    if (!flowData.name || flowData.name.trim() === '')
+      errors.push('Nome do fluxo é obrigatório');
+    if (!Array.isArray(flowData.states) || flowData.states.length === 0)
+      errors.push('Fluxo deve ter pelo menos um estado');
+    if (!Array.isArray(flowData.edges))
+      errors.push('Edges deve ser um array');
+
+    const stateIds = (flowData.states || []).map((s) => s.id);
+    for (const edge of flowData.edges || []) {
+      if (!stateIds.includes(edge.from))
+        errors.push(`Edge referencia nó inexistente: ${edge.from}`);
+      if (!stateIds.includes(edge.to))
+        errors.push(`Edge referencia nó inexistente: ${edge.to}`);
     }
+    return { valid: errors.length === 0, errors };
   }
 
-  const orphans = [];
-  for (const n of nodeRows) {
-    if (n.type === 'trigger') continue;
-    if ((incoming.get(n.id) ?? 0) === 0) orphans.push(n.id);
+  // ── Helpers privados ─────────────────────────
+
+  _toEngineFormat(flow) {
+    const nodes = flow.states || [];
+
+    // Monta mapa UUID → label para resolver as edges do banco
+    const uuidToLabel = {};
+    nodes.forEach((n) => {
+      const label = n.data?.label;
+      if (label) uuidToLabel[n.id] = label;
+    });
+
+    const states = nodes.map((n) => ({
+      id:   n.data?.label || n.id,
+      type: toEngineType(n.type),
+      ...(n.data || {}),
+    }));
+
+    const edges = (flow.edges || []).map((e) => {
+      // Resolve source/target: se for UUID, converte para label
+      const fromRaw = e.from || e.source_node_id;
+      const toRaw   = e.to   || e.target_node_id;
+      const from    = uuidToLabel[fromRaw] || fromRaw;
+      const to      = uuidToLabel[toRaw]   || toRaw;
+
+      // Converte condition objeto → função que o engine entende
+      const raw = e.condition || null;
+      let condition = null;
+      if (raw && raw.operator && raw.value != null) {
+        const val = String(raw.value).toLowerCase();
+        condition = (input) => {
+          if (input == null) return false;
+          return String(input).toLowerCase().includes(val);
+        };
+      }
+
+      return { from, to, condition };
+    });
+
+    return { ...flow, states, edges };
   }
-  if (orphans.length > 0) {
-    issues['orphans'] = `nodes sem entrada: ${orphans.join(', ')}`;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  _isFlowComplete(flow, nodeId) {
+    const node = flow.states.find((s) => s.id === nodeId);
+    return node?.type === 'end' || !node;
   }
 
-  if (hasCycle(nodeRows, edgeRows)) {
-    issues['cycle'] = 'grafo contém ciclo';
-  }
-
-  return issues;
-}
-
-function hasCycle(nodeRows, edgeRows) {
-  const adj = new Map();
-  for (const n of nodeRows) adj.set(n.id, []);
-  for (const e of edgeRows) {
-    if (adj.has(e.source_node_id)) adj.get(e.source_node_id).push(e.target_node_id);
-  }
-
-  const WHITE = 0;
-  const GRAY = 1;
-  const BLACK = 2;
-  const color = new Map();
-  for (const n of nodeRows) color.set(n.id, WHITE);
-
-  function dfs(u) {
-    color.set(u, GRAY);
-    for (const v of adj.get(u) ?? []) {
-      const c = color.get(v);
-      if (c === GRAY) return true;
-      if (c === WHITE && dfs(v)) return true;
-    }
-    color.set(u, BLACK);
-    return false;
-  }
-
-  for (const n of nodeRows) {
-    if (color.get(n.id) === WHITE && dfs(n.id)) return true;
+  _generateId() {
+    return `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   }
   return false;
 }
 
-module.exports = {
-  getFlowWithGraph,
-  updateFlow,
-  publishFlow,
-  bulkUpdateFlow,
-  createNode,
-  updateNode,
-  deleteNode,
-  createEdge,
-  deleteEdge,
-  // exportados para testes
-  _checkGraphIntegrity: checkGraphIntegrity,
-};
+module.exports = new FlowService();
