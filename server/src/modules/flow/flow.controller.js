@@ -4,10 +4,15 @@ class FlowController {
   // POST /api/flows
   async createFlow(req, res) {
     try {
-      const { name, description, chatbotId, states, edges } = req.body;
+      const { name, description, states, edges } = req.body;
+      // Aceita camelCase (chatbotId) e snake_case (chatbot_id); grava sempre como chatbot_id.
+      const chatbotId = req.body.chatbotId || req.body.chatbot_id;
 
       if (!name || name.trim() === '') {
         return res.status(400).json({ error: 'Nome do fluxo é obrigatório' });
+      }
+      if (!chatbotId) {
+        return res.status(400).json({ error: 'chatbotId é obrigatório' });
       }
 
       const validation = flowService.validateFlow({
@@ -37,10 +42,6 @@ class FlowController {
     } catch (error) {
       res.status(500).json({ error: error.message });
     }
-    const result = await service.updateFlow(req.auth.organizationId, id, body);
-    res.json(result);
-  } catch (err) {
-    next(err);
   }
 
   // GET /api/flows/:flowId
@@ -177,4 +178,6 @@ class FlowController {
       res.status(500).json({ error: error.message });
     }
   }
-};
+}
+
+module.exports = new FlowController();

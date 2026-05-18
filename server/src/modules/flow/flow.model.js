@@ -43,7 +43,16 @@ module.exports = {
   },
 
   update: async (id, data) => {
-    const payload = normalizePayload(data);
+    // Update parcial: só inclui colunas que vieram explicitamente, pra não
+    // sobrescrever chatbot_id (NOT NULL) com null quando o caller manda só name.
+    const payload = {};
+    if (data.name !== undefined)                                payload.name        = data.name;
+    if (data.version !== undefined)                             payload.version     = data.version;
+    if (data.status !== undefined)                              payload.status      = data.status;
+    if (data.chatbot_id !== undefined || data.chatbotId !== undefined) {
+      payload.chatbot_id = data.chatbot_id || data.chatbotId;
+    }
+    if (Object.keys(payload).length === 0) return await db(TABLE).where({ id }).first();
     const [flow] = await db(TABLE)
       .where({ id })
       .update({ ...payload, updated_at: db.fn.now() })
