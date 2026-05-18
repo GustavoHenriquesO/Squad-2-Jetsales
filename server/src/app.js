@@ -66,6 +66,7 @@ try {
 /*  Rotas de domínio (todas montadas em /api/v1 — contrato com o front)       */
 /* -------------------------------------------------------------------------- */
 
+app.use('api/v1/setup', ...require('./modules/setup/setup.routes')); // versel
 app.use('/api/v1', require('./routes'));
 
 /* -------------------------------------------------------------------------- */
