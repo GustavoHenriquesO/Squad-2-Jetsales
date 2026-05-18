@@ -1,62 +1,53 @@
+// server/src/modules/conversation/message.controller.js
+//
+// Endpoints aninhados em /conversations/:conversationId/messages.
+// authRequired e CSRF (em POST) já são aplicados nos níveis acima — aqui só
+// validamos input e delegamos pro service, que faz o tenant-check.
+
 const service = require('./message.service');
 
-// POST /api/messages
-exports.create = async (req, res) => {
+exports.list = async (req, res, next) => {
   try {
-    const message = await service.create(req.body);
-    res.status(201).json(message);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-};
-
-// GET /api/messages
-// Aceita query string como conversation_id para filtrar mensagens de uma conversa
-exports.findAll = async (req, res) => {
-  try {
-    const filters = req.query;
-    const messages = await service.findAll(filters);
-    res.json(messages);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-};
-
-// GET /api/messages/:id
-exports.findOne = async (req, res) => {
-  try {
-    const message = await service.findOne(req.params.id);
-    if (!message) {
-      return res.status(404).json({ error: 'Message not found' });
+    const { organizationId } = req.auth;
+    const { conversationId } = req.params;
+    const { limit, offset } = req.query;
+    const result = await service.listByConversation(organizationId, conversationId, { limit, offset });
+    if (!result) {
+      return res.status(404).json({ error: 'Conversa não encontrada', code: 'NOT_FOUND' });
     }
-    res.json(message);
+    res.json(result.messages);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 };
 
-// PUT /api/messages/:id
-exports.update = async (req, res) => {
+exports.create = async (req, res, next) => {
   try {
-    const message = await service.update(req.params.id, req.body);
-    if (!message) {
-      return res.status(404).json({ error: 'Message not found' });
-    }
-    res.json(message);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-};
+    const { organizationId } = req.auth;
+    const { conversationId } = req.params;
+    const { direction, content, flowNodeId, metadata } = req.body || {};
 
-// DELETE /api/messages/:id
-exports.remove = async (req, res) => {
-  try {
-    const deleted = await service.remove(req.params.id);
-    if (!deleted) {
-      return res.status(404).json({ error: 'Message not found' });
+    if (!direction || !service.VALID_DIRECTIONS.includes(direction)) {
+      return res.status(400).json({
+        error: `direction inválido (use ${service.VALID_DIRECTIONS.join(' ou ')})`,
+        code: 'BAD_REQUEST',
+      });
     }
-    res.json({ message: 'Message deleted' });
+    if (typeof content !== 'string' || !content.trim()) {
+      return res.status(400).json({ error: 'content é obrigatório', code: 'BAD_REQUEST' });
+    }
+
+    const row = await service.createInConversation(organizationId, conversationId, {
+      direction,
+      content: content.trim(),
+      flowNodeId,
+      metadata,
+    });
+    if (!row) {
+      return res.status(404).json({ error: 'Conversa não encontrada', code: 'NOT_FOUND' });
+    }
+    res.status(201).json(row);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 };

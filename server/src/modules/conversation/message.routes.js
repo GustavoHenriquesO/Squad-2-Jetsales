@@ -1,11 +1,12 @@
-const router = require('express').Router();
-const controller = require('./message.controller');
+// server/src/modules/conversation/message.routes.js
+//
+// Sub-router aninhado em /conversations/:conversationId/messages. Usa
+// mergeParams pra herdar `conversationId` do router pai.
 
-// CRUD de mensagens
-router.post('/', controller.create);
-router.get('/', controller.findAll);
-router.get('/:id', controller.findOne);
-router.put('/:id', controller.update);
-router.delete('/:id', controller.remove);
+const router = require('express').Router({ mergeParams: true });
+const c = require('./message.controller');
+
+router.get('/', c.list);
+router.post('/', c.create);
 
 module.exports = router;

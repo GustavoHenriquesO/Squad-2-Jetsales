@@ -1,61 +1,48 @@
+// server/src/modules/conversation/message.model.js
+//
+// Acesso direto à tabela `messages`. Schema definido em
+// 20260504_001_initial_schema.js — colunas reais:
+//   id, conversation_id, flow_node_id, direction ('in'|'out'),
+//   content, metadata, created_at.
+//
+// Multi-tenancy é garantida pelo join em conversations (queries do
+// service nunca recebem conversation_id sem antes confirmar a posse via
+// guard).
+
 const db = require('../../database');
 
 const TABLE = 'messages';
 
-// Normaliza o payload recebido pela API para o formato das colunas do Postgres
-const normalizePayload = (data) => ({
-  conversation_id: data.conversation_id || data.conversationId,
-  flow_node_id: data.flow_node_id || data.flowNodeId,
-  direction: data.direction,
-  content_type: data.content_type || data.contentType,
-  body: data.body,
-  media_url: data.media_url || data.mediaUrl,
-  metadata: data.metadata,
-  delivery_status: data.delivery_status || data.deliveryStatus,
-  retry_attempts: data.retry_attempts ?? data.retryAttempts,
-  external_id: data.external_id || data.externalId,
-  sent_at: data.sent_at || data.sentAt,
-  delivered_at: data.delivered_at || data.deliveredAt,
-  read_at: data.read_at || data.readAt,
-});
+const COLUMNS = [
+  'id',
+  'conversation_id',
+  'flow_node_id',
+  'direction',
+  'content',
+  'metadata',
+  'created_at',
+];
 
-module.exports = {
-  // Insere uma nova mensagem na tabela messages e retorna o registro criado
-  create: async (data) => {
-    const payload = normalizePayload(data);
-    const [message] = await db(TABLE).insert(payload).returning('*');
-    return message;
-  },
+async function listByConversation(conversationId, { limit = 100, offset = 0 } = {}) {
+  return db(TABLE)
+    .select(COLUMNS)
+    .where({ conversation_id: conversationId })
+    .orderBy('created_at', 'asc')
+    .limit(Math.min(Math.max(Number(limit) || 100, 1), 500))
+    .offset(Math.max(Number(offset) || 0, 0));
+}
 
-  // Lista mensagens, opcionalmente filtrando por conversation_id
-  findAll: async (filters = {}) => {
-    const query = db(TABLE).select('*').orderBy('created_at', 'desc');
+async function create({ conversationId, flowNodeId = null, direction, content, metadata }) {
+  const [row] = await db(TABLE)
+    .insert({
+      conversation_id: conversationId,
+      flow_node_id: flowNodeId,
+      direction,
+      content,
+      metadata: metadata ?? {},
+    })
+    .returning(COLUMNS);
+  return row;
+}
 
-    if (filters.conversation_id || filters.conversationId) {
-      const conversationId = filters.conversation_id || filters.conversationId;
-      query.where({ conversation_id: conversationId });
-    }
-
-    return await query;
-  },
-
-  // Busca uma mensagem pelo id
-  findOne: async (id) => {
-    return await db(TABLE).where({ id }).first();
-  },
-
-  // Atualiza um registro de mensagem e retorna o registro atualizado
-  update: async (id, data) => {
-    const payload = normalizePayload(data);
-    const [message] = await db(TABLE)
-      .where({ id })
-      .update(payload)
-      .returning('*');
-    return message;
-  },
-
-  // Remove uma mensagem pelo id
-  remove: async (id) => {
-    return await db(TABLE).where({ id }).del();
-  },
-};
+module.exports = { listByConversation, create };

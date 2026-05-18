@@ -1,21 +1,15 @@
+// server/src/modules/conversation/conversation.service.js
+//
+// Camada de regra de negócio entre controller e model. Por enquanto só repassa,
+// mas é onde futuras validações (status transitions, regras de fechamento, etc.)
+// vão morar.
+
 const Conversation = require('./conversation.model');
 
-exports.create = async (data) => {
-  return await Conversation.create(data);
-};
+const VALID_STATUS = ['open', 'closed', 'waiting', 'resolved'];
 
-exports.findAll = async (filters) => {
-  return await Conversation.findAll(filters);
-};
+exports.VALID_STATUS = VALID_STATUS;
 
-exports.findOne = async (id) => {
-  return await Conversation.findOne(id);
-};
+exports.list = (organizationId, filters) => Conversation.listByOrganization(organizationId, filters);
 
-exports.update = async (id, data) => {
-  return await Conversation.update(id, data);
-};
-
-exports.remove = async (id) => {
-  return await Conversation.remove(id);
-};
+exports.findById = (organizationId, id) => Conversation.findById(organizationId, id);

@@ -1,56 +1,57 @@
+// server/src/modules/conversation/conversation.model.js
+//
+// Acesso direto à tabela `conversations`. Schema definido em
+// 20260504_001_initial_schema.js. TODAS as queries filtram por
+// organization_id — multi-tenant é regra do projeto.
+
 const db = require('../../database');
 
 const TABLE = 'conversations';
 
-const normalizePayload = (data) => ({
-  organization_id: data.organization_id || data.organizationId,
-  contact_id: data.contact_id || data.contactId,
-  chatbot_id: data.chatbot_id || data.chatbotId,
-  whatsapp_connection_id: data.whatsapp_connection_id || data.whatsappConnectionId,
-  status: data.status,
-  close_reason: data.close_reason || data.closeReason,
-  started_at: data.started_at || data.startedAt,
-  closed_at: data.closed_at || data.closedAt,
-  last_activity_at: data.last_activity_at || data.lastActivityAt,
-});
+/* Colunas que existem na tabela (defensivo: limita SELECT pra não vazar nada
+   inesperado se alguém alterar o schema sem cuidado). */
+const COLUMNS = [
+  'id',
+  'organization_id',
+  'contact_id',
+  'chatbot_id',
+  'whatsapp_connection_id',
+  'status',
+  'current_flow_path',
+  'flow_context',
+  'current_node_id',
+  'unread_count',
+  'last_message_preview',
+  'last_message_at',
+  'closed_at',
+  'created_at',
+  'updated_at',
+];
 
-module.exports = {
-  create: async (data) => {
-    const payload = normalizePayload(data);
-    const [conversation] = await db(TABLE).insert(payload).returning('*');
-    return conversation;
-  },
+/**
+ * Lista conversas da organização, com paginação opcional.
+ * Filtros aceitos: contact_id, chatbot_id, status.
+ */
+async function listByOrganization(organizationId, { contactId, chatbotId, status, limit = 50, offset = 0 } = {}) {
+  const query = db(TABLE)
+    .select(COLUMNS)
+    .where({ organization_id: organizationId })
+    .orderBy('created_at', 'desc')
+    .limit(Math.min(Math.max(Number(limit) || 50, 1), 200))
+    .offset(Math.max(Number(offset) || 0, 0));
 
-  findAll: async (filters = {}) => {
-    const query = db(TABLE).select('*').orderBy('created_at', 'desc');
+  if (contactId) query.where({ contact_id: contactId });
+  if (chatbotId) query.where({ chatbot_id: chatbotId });
+  if (status) query.where({ status });
 
-    if (filters.organization_id || filters.organizationId) {
-      query.where('organization_id', filters.organization_id || filters.organizationId);
-    }
-    if (filters.contact_id || filters.contactId) {
-      query.where('contact_id', filters.contact_id || filters.contactId);
-    }
-    if (filters.chatbot_id || filters.chatbotId) {
-      query.where('chatbot_id', filters.chatbot_id || filters.chatbotId);
-    }
+  return query;
+}
 
-    return await query;
-  },
+async function findById(organizationId, id) {
+  return db(TABLE)
+    .select(COLUMNS)
+    .where({ organization_id: organizationId, id })
+    .first();
+}
 
-  findOne: async (id) => {
-    return await db(TABLE).where({ id }).first();
-  },
-
-  update: async (id, data) => {
-    const payload = normalizePayload(data);
-    const [conversation] = await db(TABLE)
-      .where({ id })
-      .update(payload)
-      .returning('*');
-    return conversation;
-  },
-
-  remove: async (id) => {
-    return await db(TABLE).where({ id }).del();
-  },
-};
+module.exports = { listByOrganization, findById };
