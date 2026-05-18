@@ -1,10 +1,16 @@
-const router = require('express').Router();
-const controller = require('./conversation.controller');
+// server/src/modules/conversation/conversation.routes.js
+//
+// Montado em /api/v1/conversations pelo routes/index.js (authRequired já
+// aplicado um nível acima). As rotas de mensagem ficam aninhadas em
+// /conversations/:conversationId/messages.
 
-router.post('/', controller.create);
-router.get('/', controller.findAll);
-router.get('/:id', controller.findOne);
-router.put('/:id', controller.update);
-router.delete('/:id', controller.remove);
+const router = require('express').Router();
+const c = require('./conversation.controller');
+const messageRoutes = require('./message.routes');
+
+router.get('/', c.findAll);
+router.get('/:id', c.findOne);
+
+router.use('/:conversationId/messages', messageRoutes);
 
 module.exports = router;

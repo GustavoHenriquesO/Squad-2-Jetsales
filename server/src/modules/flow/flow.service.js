@@ -250,8 +250,6 @@ class FlowService {
     flowSessions.set(sessionId, session);
     return session;
   }
-  return null;
-}
 
   async getSessionStats(sessionId) {
     const session = await this.getFlowSession(sessionId);
@@ -355,7 +353,6 @@ class FlowService {
   _generateId() {
     return `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   }
-  return false;
 }
 
 module.exports = new FlowService();
