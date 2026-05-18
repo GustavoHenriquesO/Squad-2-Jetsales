@@ -37,6 +37,10 @@ class FlowController {
     } catch (error) {
       res.status(500).json({ error: error.message });
     }
+    const result = await service.updateFlow(req.auth.organizationId, id, body);
+    res.json(result);
+  } catch (err) {
+    next(err);
   }
 
   // GET /api/flows/:flowId
@@ -173,6 +177,4 @@ class FlowController {
       res.status(500).json({ error: error.message });
     }
   }
-}
-
-module.exports = new FlowController();
+};
